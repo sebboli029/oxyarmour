@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>OxyArmour – Monitor en vivo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --txt:#e8eaf0; --mut:#9aa3b2; --acc:#4fb3ff; --ok:#3ecf8e; --warn:#ffb020; --bad:#ff5a5f; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system, system-ui, sans-serif; background:var(--bg); color:var(--txt); }
+  header { display:flex; align-items:center; gap:16px; padding:18px 24px; border-bottom:1px solid var(--line); }
+  h1 { font-size:20px; margin:0; font-weight:600; }
+  #estado { font-size:13px; color:var(--mut); }
+  button { background:var(--acc); color:#001; border:0; border-radius:8px; padding:10px 18px; font-size:14px; font-weight:600; cursor:pointer; }
+  button.sec { background:transparent; color:var(--txt); border:1px solid var(--line); }
+  main { padding:20px 24px; display:grid; gap:16px; grid-template-columns:repeat(4, 1fr); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .lbl { font-size:12px; color:var(--mut); text-transform:uppercase; letter-spacing:.04em; }
+  .big { font-size:40px; font-weight:600; margin-top:6px; }
+  .unit { font-size:16px; color:var(--mut); font-weight:400; }
+  .wide { grid-column:1 / -1; }
+  canvas { width:100%; height:220px; display:block; }
+  #log { font-family:ui-monospace, Menlo, monospace; font-size:12px; color:var(--mut); white-space:pre; height:90px; overflow:hidden; }
+  .note { font-size:12px; color:var(--mut); margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OxyArmour</h1>
+  <button id="btn">Conectar por Bluetooth</button>
+  <button id="btnDesc" class="sec" disabled>Desconectar</button>
+  <span id="estado">Desconectado</span>
+</header>
+<main>
+  <div class="card"><div class="lbl">Respiraciones por minuto</div><div class="big"><span id="rpm">–</span> <span class="unit">rpm</span></div><div class="note" id="rpmNota">Se calcula con los últimos 30 s</div></div>
+  <div class="card"><div class="lbl">Temperatura del sensor</div><div class="big"><span id="temp">–</span> <span class="unit">°C</span></div><div class="note">Temperatura de piel, no corporal interna</div></div>
+  <div class="card"><div class="lbl">Calidad de la señal</div><div class="big" id="cal" style="font-size:32px">–</div><div class="note">Verde = confiable, rojo = se descarta</div></div>
+  <div class="card"><div class="lbl">Datos recibidos</div><div class="big"><span id="hz">–</span> <span class="unit">Hz</span></div><div class="note" id="total">0 lecturas</div></div>
+  <div class="card wide"><div class="lbl">Señal de respiración — franjas rojas = movimiento, esos datos no cuentan</div><div id="mov" style="font-size:14px;font-weight:600;margin:6px 0 4px">Sin datos</div><canvas id="cResp"></canvas></div>
+  <div class="card wide"><div class="lbl">Temperatura (últimos 5 min)</div><canvas id="cTemp"></canvas></div>
+  <div class="card wide"><div class="lbl">Últimas líneas recibidas</div><div id="log"></div></div>
+</main>
+<script>
+const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const FS = 20;                        // muestras por segundo que manda la ESP32
+const VENTANA = 30 * FS;              // 30 s para respiración
+let device = null, buf = '';
+let muestras = [];                    // {t, ax, ay, az}
+let temps = [];                       // {t, temp}
+let total = 0, llegadas = [];
+const $ = id => document.getElementById(id);
+
+if (!navigator.bluetooth) {
+  $('estado').textContent = 'Este navegador no tiene Web Bluetooth: abre esta página en Google Chrome.';
+  $('btn').disabled = true;
+}
+
+$('btn').onclick = async () => {
+  try {
+    $('estado').textContent = 'Buscando OxyArmour…';
+    device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [SERVICE] });
+    device.addEventListener('gattserverdisconnected', () => { $('estado').textContent = 'Desconectado'; $('btnDesc').disabled = true; });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    const ch = await svc.getCharacteristic(TX);
+    ch.addEventListener('characteristicvaluechanged', e => recibir(new TextDecoder().decode(e.target.value)));
+    await ch.startNotifications();
+    $('estado').textContent = 'Conectado a ' + device.name;
+    $('btnDesc').disabled = false;
+  } catch (err) {
+    $('estado').textContent = 'Error: ' + err.message;
+  }
+};
+$('btnDesc').onclick = () => { if (device && device.gatt.connected) device.gatt.disconnect(); };
+
+function mediaMovil(x, n) {
+  const out = new Array(x.length); let suma = 0;
+  for (let i = 0; i < x.length; i++) {
+    suma += x[i]; if (i >= n) suma -= x[i - n];
+    out[i] = suma / Math.min(i + 1, n);
+  }
+  return out;
+}
+function dibujar(canvas, ys, color, fijo) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const c = canvas.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, w, h);
+  c.strokeStyle = '#2a2f3a'; c.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { c.beginPath(); c.moveTo(0, h * i / 4); c.lineTo(w, h * i / 4); c.stroke(); }
+  if (!ys || ys.length < 2) return;
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  if (fijo) { lo = Math.min(lo, fijo[0]); hi = Math.max(hi, fijo[1]); }
+  if (hi - lo < 1e-6) { hi += 0.5; lo -= 0.5; }
+  const pad = (hi - lo) * 0.1; lo -= pad; hi += pad;
+  c.strokeStyle = color; c.lineWidth = 2; c.beginPath();
+  ys.forEach((v, i) => { const x = i / (ys.length - 1) * w, y = h - (v - lo) / (hi - lo) * h; i ? c.lineTo(x, y) : c.moveTo(x, y); });
+  c.stroke();
+  c.fillStyle = '#9aa3b2'; c.font = '11px system-ui';
+  c.fillText(hi.toFixed(fijo ? 1 : 3), 6, 12); c.fillText(lo.toFixed(fijo ? 1 : 3), 6, h - 4);
+}
+
+// ===== Filtro de datos erróneos (movimiento, picos de temperatura, respiraciones imposibles) =====
+const UMBRAL_MAG = 0.08;     // g: si |aceleración| se aleja más de esto de 1 g, hay movimiento del cuerpo
+const UMBRAL_SALTO = 0.05;   // g: salto máximo entre dos muestras seguidas (50 ms) que puede dar la respiración
+const ASENTAR = 3;           // s que se descartan después de un movimiento
+const MIN_LIMPIO = 15;       // s de datos quietos necesarios para calcular rpm
+const RPM_MIN = 6, RPM_MAX = 40;
+let ultimoMov = -1e9, ultimoRpmValido = null, tempsCrudas = [];
+
+function recibir(txt) {
+  buf += txt + '\n';
+  const lineas = buf.split('\n'); buf = lineas.pop();
+  for (const l of lineas) {
+    const p = l.trim().split(',').map(Number);
+    if (p.length !== 4) continue;
+    const t = performance.now() / 1000;
+    total++; llegadas.push(t);
+    if (p.slice(0, 3).every(Number.isFinite)) {
+      const [ax, ay, az] = p;
+      const dev = Math.abs(Math.hypot(ax, ay, az) - 1);
+      const prev = muestras[muestras.length - 1];
+      const salto = prev ? Math.hypot(ax - prev.ax, ay - prev.ay, az - prev.az) : 0;
+      const mov = dev > UMBRAL_MAG || salto > UMBRAL_SALTO;
+      if (mov) ultimoMov = t;
+      muestras.push({ t, ax, ay, az, mov });
+    }
+    validarTemp(p[3], t);
+    const log = $('log'); log.textContent = (l + '\n' + log.textContent).split('\n').slice(0, 6).join('\n');
+  }
+  if (muestras.length > VENTANA * 2) muestras = muestras.slice(-VENTANA * 2);
+  const ahora = performance.now() / 1000;
+  temps = temps.filter(x => ahora - x.t < 300);
+  llegadas = llegadas.filter(x => ahora - x < 2);
+}
+
+// Temperatura: descarta valores imposibles (fuera de 15–45 °C) y usa la mediana de las últimas 5
+// lecturas, así un pico suelto (cable flojo, ruido) no aparece en la gráfica.
+function validarTemp(v, t) {
+  if (!Number.isFinite(v) || v < 15 || v > 45) return;
+  const ult = tempsCrudas[tempsCrudas.length - 1];
+  if (ult && v === ult.v && t - ult.t < 0.9) return;          // la ESP32 repite el mismo valor 20 veces/s
+  tempsCrudas.push({ t, v }); tempsCrudas = tempsCrudas.slice(-5);
+  temps.push({ t, temp: mediana(tempsCrudas.map(x => x.v)) });
+}
+function mediana(a) { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+
+// Señal de respiración usando SOLO los datos tomados después del último movimiento (+3 s).
+function senalRespiracion() {
+  const ventana = muestras.slice(-VENTANA);
+  if (ventana.length < FS * 2) return null;
+  const limpio = ventana.filter(m => m.t > ultimoMov + ASENTAR);
+  const durLimpio = limpio.length / FS;
+  const eje = mejorEje(ventana);
+  const base = { todo: eje, durLimpio, ahora: ventana[ventana.length - 1].t };
+  if (durLimpio < MIN_LIMPIO) return { ...base, listo: false };
+  const ejeLimpio = mejorEje(limpio);
+  return { ...base, listo: true, y: ejeLimpio.y, t: ejeLimpio.t };
+}
+function mejorEje(s) {
+  const ejes = ['ax', 'ay', 'az'].map(k => {
+    const x = s.map(m => m[k]);
+    const lento = mediaMovil(x, FS * 10);
+    const rapido = mediaMovil(x, Math.round(FS * 0.5));
+    const y = rapido.map((v, i) => v - lento[i]);
+    return { y, varianza: y.reduce((a, v) => a + v * v, 0) / y.length };
+  });
+  ejes.sort((a, b) => b.varianza - a.varianza);
+  return { y: ejes[0].y, t: s.map(m => m.t), mov: s.map(m => m.mov || m.t <= ultimoMov + ASENTAR) };
+}
+
+// Cuenta respiraciones y revisa que tengan sentido: cada ciclo debe durar entre 1,5 y 10 s
+// y los ciclos deben ser parecidos entre sí (si varían mucho, la señal no es confiable).
+function contarRespiraciones(sig) {
+  const { y, t } = sig;
+  const amp = Math.sqrt(y.reduce((a, v) => a + v * v, 0) / y.length);
+  if (amp < 0.002) return { rpm: null, calidad: 'mala', nota: 'Casi sin movimiento: ¿está puesto en el pecho?' };
+  const h = amp * 0.3;
+  let arriba = false, cruces = [];
+  for (let i = 0; i < y.length; i++) {
+    if (!arriba && y[i] > h) { arriba = true; cruces.push(t[i]); }
+    else if (arriba && y[i] < -h) arriba = false;
+  }
+  const intervalos = cruces.slice(1).map((c, i) => c - cruces[i]).filter(d => d >= 60 / RPM_MAX && d <= 60 / RPM_MIN);
+  if (intervalos.length < 3) return { rpm: null, calidad: 'regular', nota: 'Midiendo…' };
+  const prom = intervalos.reduce((a, b) => a + b, 0) / intervalos.length;
+  const cv = Math.sqrt(intervalos.reduce((a, d) => a + (d - prom) ** 2, 0) / intervalos.length) / prom;
+  if (cv > 0.5) return { rpm: null, calidad: 'mala', nota: 'Respiración irregular o ruido: no se muestra el valor' };
+  return { rpm: Math.round(60 / mediana(intervalos)), calidad: cv < 0.25 ? 'buena' : 'regular', nota: `${intervalos.length} ciclos válidos en ${Math.round(t[t.length - 1] - t[0])} s` };
+}
+
+function dibujarResp(canvas, sig) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, hh = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = hh * dpr;
+  const c = canvas.getContext('2d'); c.scale(dpr, dpr); c.clearRect(0, 0, w, hh);
+  c.strokeStyle = '#2a2f3a'; c.lineWidth = 1;
+  for (let i = 1; i < 4; i++) { c.beginPath(); c.moveTo(0, hh * i / 4); c.lineTo(w, hh * i / 4); c.stroke(); }
+  if (!sig) return;
+  const { y, mov } = sig.todo; if (y.length < 2) return;
+  const n = y.length, X = i => i / (n - 1) * w;
+  c.fillStyle = 'rgba(255,90,95,0.15)';                     // franjas rojas = movimiento (datos descartados)
+  for (let i = 0; i < n; i++) if (mov[i]) c.fillRect(X(i), 0, w / n + 1, hh);
+  const quietos = y.filter((v, i) => !mov[i]);
+  let lo = Math.min(...(quietos.length > 10 ? quietos : y)), hi = Math.max(...(quietos.length > 10 ? quietos : y));
+  if (hi - lo < 1e-6) { hi += 0.01; lo -= 0.01; }
+  const pad = (hi - lo) * 0.15; lo -= pad; hi += pad;
+  const Y = v => Math.max(0, Math.min(hh, hh - (v - lo) / (hi - lo) * hh));
+  c.lineWidth = 2;
+  for (let i = 1; i < n; i++) {
+    c.strokeStyle = mov[i] ? '#ff5a5f' : '#4fb3ff';
+    c.beginPath(); c.moveTo(X(i - 1), Y(y[i - 1])); c.lineTo(X(i), Y(y[i])); c.stroke();
+  }
+}
+
+function pintarCalidad(cal) {
+  const col = { buena: '#3ecf8e', regular: '#ffb020', mala: '#ff5a5f' }[cal] || '#9aa3b2';
+  $('cal').textContent = cal ? cal[0].toUpperCase() + cal.slice(1) : '–'; $('cal').style.color = col;
+}
+
+function actualizar() {
+  llegadas = llegadas.filter(x => performance.now() / 1000 - x < 2);
+  $('hz').textContent = llegadas.length ? (llegadas.length / 2).toFixed(0) : '–';
+  $('total').textContent = total + ' lecturas';
+  if (temps.length) $('temp').textContent = temps[temps.length - 1].temp.toFixed(1);
+  const sig = senalRespiracion();
+  const ahora = performance.now() / 1000;
+  const quieto = ahora - ultimoMov;
+  if (!sig) {
+    $('mov').textContent = muestras.length ? 'Juntando datos…' : 'Sin datos'; $('mov').style.color = '#9aa3b2';
+    pintarCalidad(null);
+  } else if (quieto < ASENTAR) {
+    $('mov').textContent = 'Movimiento detectado: datos descartados'; $('mov').style.color = '#ff5a5f';
+  } else if (!sig.listo) {
+    const falta = Math.ceil(MIN_LIMPIO - sig.durLimpio);
+    $('mov').textContent = `Quieto, juntando datos limpios (faltan ${falta} s)`; $('mov').style.color = '#ffb020';
+  } else {
+    $('mov').textContent = 'Quieto: midiendo'; $('mov').style.color = '#3ecf8e';
+  }
+  if (sig && sig.listo) {
+    const r = contarRespiraciones(sig);
+    if (r.rpm) ultimoRpmValido = r.rpm;
+    $('rpm').textContent = r.rpm ?? '–'; $('rpm').style.opacity = 1;
+    $('rpmNota').textContent = r.nota; pintarCalidad(r.calidad);
+  } else if (sig) {
+    $('rpm').textContent = ultimoRpmValido ?? '–'; $('rpm').style.opacity = 0.35;
+    $('rpmNota').textContent = ultimoRpmValido ? 'Último valor válido (en pausa)' : 'Esperando datos limpios';
+    pintarCalidad(quieto < ASENTAR ? 'mala' : 'regular');
+  }
+  const ult = muestras[muestras.length - 1];
+  if (ult && ahora - ult.t > 2) {
+    $('mov').textContent = 'Sin datos nuevos: ¿se desconectó la ESP32?'; $('mov').style.color = '#9aa3b2';
+    $('rpm').style.opacity = 0.35; pintarCalidad(null);
+  }
+  dibujarResp($('cResp'), sig);
+  dibujar($('cTemp'), temps.map(x => x.temp), '#ffb020', [20, 38]);
+}
+
+setInterval(actualizar, 250);
+</script>
+</body>
+</html>
